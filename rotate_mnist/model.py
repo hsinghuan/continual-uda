@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Function
 
 class Encoder(nn.Module):
     def __init__(self):
@@ -42,32 +41,3 @@ class Classifier(nn.Module):
         # return output
 
 
-class DomainClassifier(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.dropout = nn.Dropout(0.5)
-        self.linear1 = nn.Linear(9216, 128)
-        self.linear2 = nn.Linear(128, 2)
-
-    def forward(self, x):
-        x = self.linear1(x)
-        x = F.relu(x)
-        x = self.dropout(x)
-        x = self.linear2(x)
-        # x = F.log_softmax(x, dim=1)
-        return x
-
-
-class ReverseLayerF(Function):
-
-    @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.alpha = alpha
-
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        output = grad_output.neg() * ctx.alpha
-
-        return output, None

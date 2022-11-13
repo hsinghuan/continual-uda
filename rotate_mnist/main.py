@@ -120,8 +120,10 @@ def main(args):
 
     if args.method == "jan":
         adapter = method.JointAdaptationNetwork(encoder, classifier, train_loader, val_loader, device, args)
+    elif args.method == "dann":
+        adapter = method.DomainAdversarialNetwork(encoder, classifier, train_loader, val_loader, device, args)
 
-
+    print("encoder device", next(encoder.parameters()).device)
     for i, stage in enumerate(stages[1:]):
         os.makedirs(os.path.join(args.ckpt_dir, str(stage[0]) + "_" + str(stage[1])) , exist_ok=True)
         torch.save({"encoder": encoder,
@@ -140,7 +142,8 @@ def main(args):
 
         if args.method == "dann":
             lambda_coeff_list = [0.1, 0.3, 0.5]
-            encoder, classifier, val_score, tgt_test_acc = method.dann(encoder, classifier, train_loader, val_loader, tgt_train_loader, tgt_val_loader, lambda_coeff_list, stage, device, args, test_epoch_fn=test_epoch)
+            adapter.adapt(tgt_train_loader, tgt_val_loader, lambda_coeff_list, stage, args)
+            encoder, classifier = adapter.get_encoder_classifier()
 
         elif args.method == "jan":
             lambda_coeff_list = [0.5, 1, 5]
@@ -170,9 +173,13 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, help="learning rate", default=1e-3)
     parser.add_argument("--train_epochs", type=int, help="number of training epochs", default=10)
     parser.add_argument("--adapt_epochs", type=int, help="number of adaptation epochs", default=100)
+    parser.add_argument('--replay', dest='replay', action='store_true')
+    parser.set_defaults(replay=False)
+    parser.add_argument("--buffer_size", type=int, help="size of buffer", default=1024)
+    parser.add_argument("--replay_batch_size", type=int, help="replay batch size", default=256)
     parser.add_argument("--model_seed", type=int, help="seed for random number generator", default=42)
     parser.add_argument("--gpuID", type=int, help="which device to use", default=0)
     args = parser.parse_args()
 
-
+    print(args)
     main(args)

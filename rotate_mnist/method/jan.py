@@ -1,3 +1,7 @@
+"""
+The JMMD implementation is from https://github.com/thuml/Transfer-Learning-Library/blob/7f0bc105f1d8adedf6e8d281a29ced8814d96065/tllib/alignment/jan.py#L19
+The Gaussian kernel implementation is from https://github.com/thuml/Transfer-Learning-Library/blob/master/tllib/modules/kernels.py
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,11 +12,11 @@ from tqdm import tqdm
 import numpy as np
 import os
 from pytorch_adapt.validators import IMValidator
-
+from .buffer import Buffer
 
 
 class JointAdaptationNetwork():
-    def __init__(self, encoder, classifier, src_train_loader, src_val_loader, device, args, replay=False):
+    def __init__(self, encoder, classifier, src_train_loader, src_val_loader, device, args):
 
         self.device = device
         self.set_encoder_classifier(encoder, classifier)
@@ -31,10 +35,12 @@ class JointAdaptationNetwork():
 
         self.validator = IMValidator()
 
-        if replay:
-            pass
+        self.replay = args.replay
+        if self.replay:
+            self.buffer = Buffer(args.buffer_size, self.device)
+            self.replay_batch_size = args.replay_batch_size
 
-    def _adapt_train_epoch(self, encoder, classifier, tgt_train_loader, optimizer, lambda_coeff):
+    def _adapt_train_epoch(self, encoder, classifier, tgt_train_loader, optimizer, lambda_coeff, buffer=None, replay_coeff=0.1):
         encoder.train()
         classifier.train()
         self.jmmd_loss.train()
@@ -45,6 +51,7 @@ class JointAdaptationNetwork():
         total_loss = 0
         total_cls_loss = 0
         total_transfer_loss = 0
+        total_replay_loss = 0
         total_src_data_size = 0
 
         for i in tqdm(range(len_dataloader)):
@@ -61,8 +68,16 @@ class JointAdaptationNetwork():
             tgt_y, tgt_f = classifier(encoder(tgt_data), return_feature = True)
             cls_loss = F.nll_loss(F.log_softmax(src_y, dim=1), src_label)
             transfer_loss = self.jmmd_loss((src_f, F.softmax(src_y, dim=1)), (tgt_f, F.softmax(tgt_y, dim=1)))
-            loss = cls_loss + transfer_loss * lambda_coeff
 
+
+            replay_loss = torch.tensor(0.)
+            if self.replay:
+                if not buffer.is_empty():
+                    buf_inputs, buf_logits = buffer.get_data(self.replay_batch_size)
+                    buf_outputs = classifier(encoder(buf_inputs))
+                    replay_loss = F.mse_loss(buf_outputs, buf_logits)
+                buffer.add_data(examples=tgt_data, logits=tgt_y.data)
+            loss = cls_loss + transfer_loss * lambda_coeff + replay_loss * replay_coeff
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -70,12 +85,14 @@ class JointAdaptationNetwork():
             total_loss += loss.item() * src_data.size(0)
             total_cls_loss += cls_loss.item() * src_data.size(0)
             total_transfer_loss += transfer_loss.item() * src_data.size(0)
+            total_replay_loss += replay_loss.item() * src_data.size(0)
             total_src_data_size += src_data.size(0)
 
         total_loss /= total_src_data_size
         total_cls_loss /= total_src_data_size
         total_transfer_loss /= total_src_data_size
-        return total_loss, total_cls_loss, total_transfer_loss
+        total_replay_loss /= total_src_data_size
+        return total_loss, total_cls_loss, total_transfer_loss, total_replay_loss
 
     @torch.no_grad()
     def _adapt_test_epoch(self, encoder, classifier, tgt_val_loader, lambda_coeff):
@@ -105,6 +122,7 @@ class JointAdaptationNetwork():
             tgt_y, tgt_f = classifier(encoder(tgt_data), return_feature = True)
             cls_loss = F.nll_loss(F.log_softmax(src_y, dim=1), src_label)
             transfer_loss = self.jmmd_loss((src_f, F.softmax(src_y, dim=1)), (tgt_f, F.softmax(tgt_y, dim=1)))
+
             loss = cls_loss + transfer_loss * lambda_coeff
 
 
@@ -123,6 +141,10 @@ class JointAdaptationNetwork():
     def _adapt_train_test(self, tgt_train_loader, tgt_val_loader, lambda_coeff, args, test_epoch_fn=None):
         encoder = deepcopy(self.encoder)
         classifier = deepcopy(self.classifier)
+        if self.replay:
+            buffer = deepcopy(self.buffer)
+        else:
+            buffer = None
         optimizer = torch.optim.Adam(list(encoder.parameters()) + list(classifier.parameters()), lr=args.lr)
 
         best_val_loss = np.inf
@@ -132,7 +154,7 @@ class JointAdaptationNetwork():
         staleness = 0
 
         for e in range(1, self.adapt_epochs + 1):
-            total_train_loss, total_train_cls_loss, total_train_transfer_loss = self._adapt_train_epoch(encoder, classifier, tgt_train_loader, optimizer, lambda_coeff)
+            total_train_loss, total_train_cls_loss, total_train_transfer_loss, total_train_replay_loss = self._adapt_train_epoch(encoder, classifier, tgt_train_loader, optimizer, lambda_coeff, buffer)
             total_val_loss, total_val_cls_loss, total_val_transfer_loss, tgt_logits = self._adapt_test_epoch(encoder, classifier, tgt_val_loader, lambda_coeff)
             val_score = self.validator(target_train={'logits': tgt_logits})
             if total_val_loss < best_val_loss:
@@ -144,12 +166,14 @@ class JointAdaptationNetwork():
             else:
                 staleness += 1
             print(
-                f'Lambda Coeff {lambda_coeff} Epoch {e}/{self.adapt_epochs} Train Total Loss: {round(total_train_loss, 3)} Train Cls Loss: {round(total_train_cls_loss, 3)} Train Transfer Loss: {round(total_train_transfer_loss, 3)} \n Val Total Loss: {round(total_val_loss, 3)} Val Cls Loss: {round(total_val_cls_loss, 3)} Val Transfer Loss: {round(total_val_transfer_loss, 3)}')
+                f'Lambda Coeff {lambda_coeff} Epoch {e}/{self.adapt_epochs} Train Total Loss: {round(total_train_loss, 3)} Train Cls Loss: {round(total_train_cls_loss, 3)} Train Transfer Loss: {round(total_train_transfer_loss, 3)} Train Replay Loss: {round(total_train_replay_loss, 3)} \n \
+                Val Total Loss: {round(total_val_loss, 3)} Val Cls Loss: {round(total_val_cls_loss, 3)} Val Transfer Loss: {round(total_val_transfer_loss, 3)}')
 
             self.writer.add_scalar('Total Loss/train', total_train_loss, e)
             self.writer.add_scalar('Total Loss/val', total_val_loss, e)
             self.writer.add_scalar('Source Label Loss/train', total_train_cls_loss, e)
             self.writer.add_scalar('Transfer Loss/train', total_train_transfer_loss, e)
+            self.writer.add_scalar('Replay Loss/train', total_train_replay_loss, e)
             self.writer.add_scalar('Source Label Loss/val', total_val_cls_loss, e)
             self.writer.add_scalar('Transfer Loss/val', total_val_transfer_loss, e)
 
@@ -161,29 +185,27 @@ class JointAdaptationNetwork():
 
         encoder = deepcopy(best_encoder)
         classifier = deepcopy(best_classifier)
-
-        return encoder, classifier, best_val_score
+        return encoder, classifier, buffer, best_val_score
 
 
     def adapt(self, tgt_train_loader, tgt_val_loader, lambda_coeff_list, stage, args, test_epoch_fn=None):
-        performance_dict = dict()
+        val_score_list = []
+        encoder_list = []
+        classifier_list = []
+        buffer_list = []
         for lambda_coeff in lambda_coeff_list:
             run_name = "jan" + str(lambda_coeff).replace(".", "") + "_" + str(args.model_seed)
             self.writer = SummaryWriter(os.path.join(args.log_dir, str(stage[0]) + '_' + str(stage[1]), run_name))
-            encoder, classifier, val_score = self._adapt_train_test(tgt_train_loader, tgt_val_loader, lambda_coeff, args, test_epoch_fn)
-            performance_dict[lambda_coeff] = {'tgt_encoder': encoder, 'tgt_classifier': classifier,
-                                              'tgt_val_score': val_score}
+            encoder, classifier, buffer, val_score = self._adapt_train_test(tgt_train_loader, tgt_val_loader, lambda_coeff, args, test_epoch_fn)
+            val_score_list.append(val_score)
+            encoder_list.append(encoder)
+            classifier_list.append(classifier)
+            buffer_list.append(buffer)
 
-        best_val_score = -np.inf
-        best_encoder = None
-        best_classifier = None
-        for lambda_coeff, perf_dict in performance_dict.items():
-            if perf_dict['tgt_val_score'] > best_val_score:
-                best_val_score = perf_dict['tgt_val_score']
-                best_encoder = perf_dict['tgt_encoder']
-                best_classifier = perf_dict['tgt_classifier']
+        best_idx = max(range(len(val_score_list)), key=val_score_list.__getitem__)
 
-        self.set_encoder_classifier(best_encoder, best_classifier)
+        self.set_encoder_classifier(encoder_list[best_idx], classifier_list[best_idx])
+        self.buffer = buffer_list[best_idx]
         # return best_encoder, best_classifier
 
 
