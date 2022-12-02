@@ -188,14 +188,16 @@ class JointAdaptationNetwork():
         return encoder, classifier, buffer, best_val_score
 
 
-    def adapt(self, tgt_train_loader, tgt_val_loader, lambda_coeff_list, stage, args, test_epoch_fn=None):
+    def adapt(self, tgt_train_loader, tgt_val_loader, lambda_coeff_list, stage_idx, args, test_epoch_fn=None):
         val_score_list = []
         encoder_list = []
         classifier_list = []
         buffer_list = []
+        revisit = "revisit" if args.revisit else "norevisit"
+        replay = "replay" if args.replay else "noreplay"
         for lambda_coeff in lambda_coeff_list:
-            run_name = "jan" + str(lambda_coeff).replace(".", "") + "_" + str(args.model_seed)
-            self.writer = SummaryWriter(os.path.join(args.log_dir, str(stage[0]) + '_' + str(stage[1]), run_name))
+            run_name = "jan" + str(lambda_coeff).replace(".", "") + "_" + str(args.model_seed) + "_" + replay
+            self.writer = SummaryWriter(os.path.join(args.log_dir, revisit, str(stage_idx), run_name))
             encoder, classifier, buffer, val_score = self._adapt_train_test(tgt_train_loader, tgt_val_loader, lambda_coeff, args, test_epoch_fn)
             val_score_list.append(val_score)
             encoder_list.append(encoder)
